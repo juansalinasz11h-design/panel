@@ -1,0 +1,277 @@
+"""Windows WARP keeper: keeps the selected WARP mode connected and repairs dropped tunnels."""
+
+from __future__ import annotations
+
+import os
+import socket
+import sys
+import threading
+import time
+
+from ouc_common import (
+    KEEPER_LOG_FILE,
+    SERVICE_PROXY_PORT,
+    acquire_mutex,
+    append_log,
+    ensure_dirs,
+    ensure_warp_mode,
+    ensure_warp_protocol,
+    find_warp_cli,
+    is_admin,
+    is_keeper_paused,
+    repair_warp_registration,
+    run_warp,
+    warp_mode,
+    warp_status,
+)
+from ouc_firewall import install_killswitch, is_killswitch_installed
+from zen_proxy import start_proxy_server
+
+TICK_SECONDS = 45
+REPAIR_COOLDOWN_SECONDS = 120.0
+PROXY_WATCH_SECONDS = 3.0
+HEARTBEAT_FILE = KEEPER_LOG_FILE.parent / "heartbeat.txt"
+_PROXY_LOCK = threading.Lock()
+_last_repair = 0.0
+
+
+def _heartbeat() -> None:
+    """Cheap liveness signal the app checks; a running but hung keeper stops writing this."""
+    try:
+        HEARTBEAT_FILE.write_text(str(int(time.time())), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _active_scope() -> str:
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    try:
+        from proxy_chain import get_egress_config
+
+        return str(get_egress_config().get("warp_scope", default_scope))
+    except Exception:
+        return default_scope
+
+
+def _wait_connected(warp_bin: str, attempts: int = 10) -> bool:
+    for _ in range(attempts):
+        time.sleep(1.0)
+        connected, _, _ = warp_status(warp_bin=warp_bin, force=True)
+        if connected:
+            return True
+    return False
+
+
+def _connect(warp_bin: str, scope: str) -> bool:
+    ensure_warp_mode(warp_bin, scope)
+    ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+    run_warp(["connect"], warp_bin=warp_bin, timeout=12.0)
+    return _wait_connected(warp_bin)
+
+
+def _registration_missing(raw: str) -> bool:
+    low = (raw or "").lower()
+    return any(
+        marker in low
+        for marker in ("registration missing", "not registered", "no registration")
+    )
+
+
+def ensure_connected(warp_bin: str | None = None) -> bool:
+    """Keep the WARP tunnel connected without resetting a healthy session."""
+    global _last_repair
+
+    if not warp_bin:
+        warp_bin = find_warp_cli()
+    if not warp_bin:
+        return False
+
+    scope = _active_scope()
+    desired_mode = "proxy" if scope == "isolated" else "warp"
+    connected, _mode, raw = warp_status(warp_bin=warp_bin, force=True)
+    if connected:
+        current_mode = warp_mode(warp_bin=warp_bin)
+        if not current_mode or current_mode == desired_mode:
+            return True
+        # The selected scope changed while the tunnel stayed up. Apply the
+        # mode before returning so the isolated proxy port is actually bound.
+        append_log(
+            KEEPER_LOG_FILE,
+            f"operation mode drift ({current_mode} -> {desired_mode}) — applying selected scope",
+        )
+        ensure_warp_mode(warp_bin, scope)
+        if _wait_connected(warp_bin, 8):
+            return True
+        _, _, raw = warp_status(warp_bin=warp_bin, force=True)
+
+    low = (raw or "").lower()
+    if "connecting" in low or "reconnecting" in low:
+        if _wait_connected(warp_bin, 8):
+            return True
+        _, _, raw = warp_status(warp_bin=warp_bin, force=True)
+
+    if _registration_missing(raw):
+        append_log(KEEPER_LOG_FILE, "registration missing — creating a new one")
+        if not repair_warp_registration(warp_bin, 3):
+            return False
+        raw = ""
+
+    if _connect(warp_bin, scope):
+        return True
+
+    if time.monotonic() - _last_repair < REPAIR_COOLDOWN_SECONDS:
+        return False
+    _last_repair = time.monotonic()
+
+    append_log(KEEPER_LOG_FILE, "tunnel disconnected — renewing keys and reconnecting")
+    run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin, timeout=15.0)
+    if _connect(warp_bin, scope):
+        return True
+
+    _, _, raw = warp_status(warp_bin=warp_bin, force=True)
+    if _registration_missing(raw):
+        if repair_warp_registration(warp_bin, 3) and _connect(warp_bin, scope):
+            return True
+    return False
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.6):
+            return True
+    except OSError:
+        return False
+
+
+def _start_service_proxy(quiet: bool = False) -> object | None:
+    with _PROXY_LOCK:
+        if _port_open(SERVICE_PROXY_PORT):
+            return None
+        try:
+            srv, bound_port, edge = start_proxy_server(SERVICE_PROXY_PORT)
+            if not quiet:
+                append_log(
+                    KEEPER_LOG_FILE,
+                    f"service proxy listening on 127.0.0.1:{bound_port} (edge={edge})",
+                )
+            return srv
+        except Exception as exc:
+            if not quiet:
+                append_log(
+                    KEEPER_LOG_FILE,
+                    f"service proxy bind failed on port {SERVICE_PROXY_PORT}: {exc}",
+                )
+            return None
+
+
+def _proxy_watchdog() -> None:
+    """Keep the local proxy served; rebind it within seconds if it disappears."""
+    servers = []  # keep references so the servers are not garbage collected
+    bind_failing = False
+    while True:
+        try:
+            if not _port_open(SERVICE_PROXY_PORT):
+                srv = _start_service_proxy(quiet=True)
+                if srv is not None:
+                    servers.append(srv)
+                    bind_failing = False
+                elif not bind_failing:
+                    append_log(
+                        KEEPER_LOG_FILE,
+                        f"service proxy is not listening on port {SERVICE_PROXY_PORT}; retrying every "
+                        f"{int(PROXY_WATCH_SECONDS)}s",
+                    )
+                    bind_failing = True
+        except Exception:
+            pass
+        time.sleep(PROXY_WATCH_SECONDS)
+
+
+def main() -> int:
+    ensure_dirs()
+    mutex = acquire_mutex("OpencodeUnlimitedKeeper")
+    if mutex is None:
+        return 0
+
+    warp_bin = find_warp_cli()
+    append_log(KEEPER_LOG_FILE, f"keeper up (tick={TICK_SECONDS}s, warp={'found' if warp_bin else 'none'})")
+    _heartbeat()
+
+    # Start the desktop/service proxy on 41987 so every egress mode is routable.
+    proxy_srv = _start_service_proxy()
+    reported_external = proxy_srv is None and _port_open(SERVICE_PROXY_PORT)
+    threading.Thread(target=_proxy_watchdog, daemon=True).start()
+
+    # On startup, allow network interface initialization if booting and warp is installed
+    if warp_bin:
+        for _ in range(6):
+            rc, _ = run_warp(["status"], warp_bin=warp_bin, timeout=8.0)
+            if rc == 0:
+                break
+            time.sleep(8)
+
+    while True:
+        try:
+            _heartbeat()
+            if proxy_srv is None and not _port_open(SERVICE_PROXY_PORT):
+                proxy_srv = _start_service_proxy()
+            elif proxy_srv is None and not reported_external:
+                append_log(KEEPER_LOG_FILE, "service proxy is already listening")
+                reported_external = True
+
+            if warp_bin is None:
+                warp_bin = find_warp_cli()
+
+            mode = "warp"
+            try:
+                from proxy_chain import get_egress_config
+                mode = get_egress_config().get("mode", "warp")
+            except Exception:
+                pass
+
+            if mode in ("warp", "clean"):
+                if warp_bin and not is_keeper_paused():
+                    ensure_connected(warp_bin)
+                    if is_admin() and (
+                        os.environ.get("OUC_FIREWALL_KILLSWITCH") == "1"
+                        or is_killswitch_installed()
+                    ):
+                        if not is_killswitch_installed():
+                            install_killswitch()
+            elif mode == "tor":
+                # Restart the managed Tor daemon only when its process is gone,
+                # or when a live process has not opened its SOCKS port after a
+                # generous bootstrap window. Restarting on every tick would kill
+                # a slow first bootstrap before it completes.
+                try:
+                    from tor_manager import (
+                        TOR_PID_FILE,
+                        get_active_tor_target,
+                        is_portable_tor_running,
+                        start_portable_tor,
+                        stop_portable_tor,
+                    )
+                    if not get_active_tor_target():
+                        if not is_portable_tor_running():
+                            start_portable_tor()
+                        else:
+                            try:
+                                age = time.time() - TOR_PID_FILE.stat().st_mtime
+                            except OSError:
+                                age = 0.0
+                            if age > 240.0:
+                                append_log(
+                                    KEEPER_LOG_FILE,
+                                    "Tor SOCKS port did not open within 240s — restarting Tor",
+                                )
+                                stop_portable_tor()
+                                start_portable_tor()
+                except Exception:
+                    pass
+        except Exception as exc:
+            append_log(KEEPER_LOG_FILE, f"keeper error: {exc}")
+        time.sleep(TICK_SECONDS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
